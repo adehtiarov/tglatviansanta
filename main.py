@@ -19,14 +19,19 @@ load_dotenv()
 
 import logging
 import os
+import tempfile
 import asyncio
 
-from openai import OpenAI 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), organization=os.getenv("OPENAI_ORGANIZATION_ID"))
+from openai import AsyncOpenAI 
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"), organization=os.getenv("OPENAI_ORGANIZATION_ID"))
 assistant_id = os.getenv("OPENAI_ASSISTANT_ID")
 
 from telegram import ForceReply, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+
+from pydub import AudioSegment
+import requests
+from io import BytesIO
 
 # Enable logging
 logging.basicConfig(
@@ -44,9 +49,13 @@ threads = {}
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
     user = update.effective_user
-    threads[user.id] = client.beta.threads.create()
+    threads[user.id] = await openai_client.beta.threads.create()
     await update.message.reply_html(
-        rf"Sveiki {user.mention_html()}!",
+        rf"""Sveiki {user.mention_html()}! Добро пожаловать в увлекательное путешествие изучения латышского языка!
+Я могу помочь вам с тренировкой на основании материалов подготовки к экзамену, которые я уже узнаю.
+Практикуйте разговоры на латышском со мной.
+Если отправите текст, то я отвечу текстом. Если отправите голосовое сообщение, то я отвечу и голосовым сообщением, и текстом.
+Для сброса текущей беседы, отправьте /start""",
         reply_markup=ForceReply(selective=True),
     )
 
@@ -55,23 +64,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Send a message when the command /help is issued."""
     await update.message.reply_text("Help!")
 
-
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Echo the user message."""
-    user = update.effective_user
-    thread = threads[user.id]
-    message = client.beta.threads.messages.create(
+async def generate_response(user_id, text):
+    if user_id not in threads:
+        threads[user_id] = await openai_client.beta.threads.create()
+    thread = threads[user_id]
+    message = await openai_client.beta.threads.messages.create(
         thread_id=thread.id,
         role="user",
-        content=update.message.text
+        content=text
     )
-    run = client.beta.threads.runs.create(
+    run = await openai_client.beta.threads.runs.create(
         thread_id=thread.id,
         assistant_id=assistant_id
     )
     await asyncio.sleep(1)
     while run.status == "queued" or run.status == "in_progress":
-        run = client.beta.threads.runs.retrieve(
+        run = await openai_client.beta.threads.runs.retrieve(
             thread_id=thread.id,
             run_id=run.id
         )
@@ -79,12 +87,68 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     response = ""
     if run.status == "completed":
-        messages = client.beta.threads.messages.list(thread_id=thread.id)
+        messages = await openai_client.beta.threads.messages.list(thread_id=thread.id)
         response = messages.data[0].content[0].text.value
     else:
         response = "Something went wrong. Please try again. Assistant run status: " + run.status
+    return response
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Echo the user message."""
+    user = update.effective_user
+    response = await generate_response(user.id, update.message.text)
     await update.message.reply_text(response)
 
+async def transcribe_audio(audio_stream):
+    transcript = await openai_client.audio.transcriptions.create(
+        model="whisper-1", 
+        file=audio_stream,
+        response_format="text",
+        temperature=0.0,
+        language="lv",
+    )
+    return transcript
+
+async def get_tts_audio(text):
+    response = await openai_client.audio.speech.create(
+        model="tts-1",
+        voice="echo",
+        input=text,
+    )
+    return response.content
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle voice messages."""
+    print("Voice received")
+    voice = update.message.voice
+    file = await context.bot.get_file(voice.file_id)
+    file_path = file.file_path
+
+    # Download the voice file
+    response = requests.get(file_path)
+    print(f"Downloaded: {file_path}")
+    voice_file = BytesIO(response.content)
+
+    # Convert from OGG to MP3
+    audio = AudioSegment.from_file(voice_file, format="ogg", codec="opus")
+
+    audio_prompt = ""
+    with tempfile.NamedTemporaryFile(suffix=".mp3") as temp_mp3:
+        audio.export(temp_mp3.name, format="mp3")
+        temp_mp3.seek(0)
+        print(f"Converted: {temp_mp3.name}")
+        with open(temp_mp3.name, "rb") as audio_stream:
+            audio_prompt = await transcribe_audio(audio_stream)
+            print(f"Transcribed: {audio_prompt}")
+
+    assistant_response = await generate_response(update.effective_user.id, audio_prompt)
+    print(f"Assistant response: {assistant_response}")
+    await update.message.reply_text(assistant_response)
+    with BytesIO(await get_tts_audio(assistant_response)) as audio_file:
+        audio_file.seek(0)
+        # Send the MP3 file back to the user
+        await update.message.reply_audio(audio_file, filename="voice_message.mp3")
+        print("Sent audio response")
 
 def main() -> None:
     """Start the bot."""
@@ -102,6 +166,7 @@ def main() -> None:
 
     # on non command i.e message - echo the message on Telegram
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     # Run the bot until the user presses Ctrl-C
     application.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -9,6 +9,8 @@ verify_ssl = true
 python-dotenv = "*"
 python-telegram-bot = "*"
 openai = "*"
+pydub = "*"
+requests = "*"
 
 [requires]
 python_version = "3.9"
